@@ -348,6 +348,7 @@ type reconcilerParams struct {
 	db                  *statedb.DB
 	devices             statedb.Table[*tables.Device]
 	proxies             chan reconciliationRequest[proxyInfo]
+	routeUpdates        chan struct{}
 	addNoTrackPod       chan reconciliationRequest[noTrackPodInfo]
 	delNoTrackPod       chan reconciliationRequest[noTrackPodInfo]
 	addNoTrackHostPorts chan reconciliationRequest[noTrackHostPortsPodInfo]
@@ -409,6 +410,53 @@ type Manager interface {
 	RemoveNoTrackHostPorts(namespace, name string)
 }
 
+func (m *manager) startRouteWatcher(ctx context.Context) {
+	routeCh := make(chan netlink.RouteUpdate)
+	doneCh := make(chan struct{})
+
+	if err := netlink.RouteSubscribe(routeCh, doneCh); err != nil {
+		m.logger.Warn("Failed to subscribe to route updates", logfields.Error, err)
+		return
+	}
+	go func() {
+		lastTrigger := time.Now()
+
+		for {
+			select {
+			case <-ctx.Done():
+				// Safe close: avoid double close panic
+				select {
+				case <-doneCh:
+					// already closed
+				default:
+					close(doneCh)
+				}
+				return
+
+			case _, ok := <-routeCh:
+				if !ok {
+					// channel closed by netlink, exit gracefully
+					return
+				}
+
+				// Debounce: avoid event storm
+				if time.Since(lastTrigger) < 500*time.Millisecond {
+					continue
+				}
+				lastTrigger = time.Now()
+
+				m.logger.Debug("Route update detected, triggering reconciliation")
+
+				// Non-blocking trigger
+				select {
+				case m.reconcilerParams.routeUpdates <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+}
+
 func newManager(p params) Manager {
 	iptMgr := &manager{
 		logger:    p.Logger,
@@ -422,6 +470,7 @@ func newManager(p params) Manager {
 			db:                  p.DB,
 			devices:             p.Devices,
 			proxies:             make(chan reconciliationRequest[proxyInfo]),
+			routeUpdates:        make(chan struct{}, 1),
 			addNoTrackPod:       make(chan reconciliationRequest[noTrackPodInfo]),
 			delNoTrackPod:       make(chan reconciliationRequest[noTrackPodInfo]),
 			addNoTrackHostPorts: make(chan reconciliationRequest[noTrackHostPortsPodInfo]),
@@ -489,6 +538,7 @@ func newManager(p params) Manager {
 				iptMgr.setNoTrackHostPorts,
 				iptMgr.removeNoTrackHostPorts,
 			)
+
 		}),
 	)
 
@@ -501,6 +551,7 @@ func newManager(p params) Manager {
 
 // Start initializes the iptables manager and checks for iptables kernel modules availability.
 func (m *manager) Start(ctx cell.HookContext) error {
+	m.startRouteWatcher(ctx)
 	defer m.startDone()
 
 	if os.Getenv("CILIUM_PREPEND_IPTABLES_CHAIN") != "" {
@@ -1525,86 +1576,108 @@ func (m *manager) installMasqueradeRules(
 			family = netlink.FAMILY_V6
 		}
 		initialPass := true
-		if routes, err := safenetlink.RouteList(nil, family); err == nil {
-		nextPass:
-			for _, r := range routes {
-				var link netlink.Link
-				match := false
-				if r.LinkIndex > 0 {
-					link, err = netlink.LinkByIndex(r.LinkIndex)
-					if err != nil {
-						continue
-					}
-					// Routes are dedicated to the specific interface, so we
-					// need to install the SNAT rules also for that interface
-					// via -o. If we cannot correlate to anything because no
-					// devices were specified, we need to bail out.
-					if len(devices) == 0 {
-						return fmt.Errorf("cannot correlate source route device for generating masquerading rules")
-					}
-					for _, device := range devices {
-						filter := tables.DeviceFilter{device}
-						m, reverse := filter.Match(link.Attrs().Name)
-						if m {
-							match = !reverse
-							break
-						}
-					}
-				} else {
-					// There might be next hop groups where ifindex is zero
-					// and the underlying next hop devices might not be known
-					// to Cilium. In this case, assume match and don't encode
-					// -o device.
-					match = true
+		routes, err := safenetlink.RouteList(nil, family)
+		if err != nil {
+			m.logger.Warn("Failed to list routes", logfields.Error, err)
+			return nil
+		}
+		validRoutes := 0
+		totalRoutes := 0
+
+		for _, r := range routes {
+			if r.Dst != nil && r.Dst.IP.IsGlobalUnicast() {
+				totalRoutes++
+				if r.Src != nil {
+					validRoutes++
 				}
-				_, exclusionCIDR, err := net.ParseCIDR(snatDstExclusionCIDR)
-				if !match || r.Src == nil || (err == nil && cidr.Equal(r.Dst, exclusionCIDR)) {
+			}
+		}
+		if validRoutes == 0 {
+			m.logger.Warn(
+				"Skipping SNAT reconciliation: no routes with valid source IPs",
+				"totalRoutes", totalRoutes,
+				"validRoutes", validRoutes,
+			)
+			return nil
+		}
+	nextPass:
+		for _, r := range routes {
+			var link netlink.Link
+			match := false
+			if r.LinkIndex > 0 {
+				link, err = netlink.LinkByIndex(r.LinkIndex)
+				if err != nil {
 					continue
 				}
-				if initialPass && cidr.Equal(r.Dst, cidr.ZeroNet(r.Family)) {
-					defaultRoutes = append(defaultRoutes, r)
-					continue
+				// Routes are dedicated to the specific interface, so we
+				// need to install the SNAT rules also for that interface
+				// via -o. If we cannot correlate to anything because no
+				// devices were specified, we need to bail out.
+				if len(devices) == 0 {
+					return fmt.Errorf("cannot correlate source route device for generating masquerading rules")
 				}
-				progArgs := []string{
-					"-t", "nat",
-					"-A", ciliumPostNatChain,
-					"-s", allocRange,
+				for _, device := range devices {
+					filter := tables.DeviceFilter{device}
+					m, reverse := filter.Match(link.Attrs().Name)
+					if m {
+						match = !reverse
+						break
+					}
 				}
-				if cidr.Equal(r.Dst, cidr.ZeroNet(r.Family)) {
-					progArgs = append(
-						progArgs,
-						"!", "-d", snatDstExclusionCIDR)
-				} else {
-					progArgs = append(
-						progArgs,
-						"-d", r.Dst.String())
-				}
-				if link != nil {
-					progArgs = append(
-						progArgs,
-						"-o", link.Attrs().Name)
-				} else {
-					progArgs = append(
-						progArgs,
-						"!", "-o", "cilium_+")
-				}
+			} else {
+				// There might be next hop groups where ifindex is zero
+				// and the underlying next hop devices might not be known
+				// to Cilium. In this case, assume match and don't encode
+				// -o device.
+				match = true
+			}
+			_, exclusionCIDR, err := net.ParseCIDR(snatDstExclusionCIDR)
+			if !match || r.Src == nil || (err == nil && cidr.Equal(r.Dst, exclusionCIDR)) {
+				continue
+			}
+			if initialPass && cidr.Equal(r.Dst, cidr.ZeroNet(r.Family)) {
+				defaultRoutes = append(defaultRoutes, r)
+				continue
+			}
+			progArgs := []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"-s", allocRange,
+			}
+			if cidr.Equal(r.Dst, cidr.ZeroNet(r.Family)) {
 				progArgs = append(
 					progArgs,
-					"-m", "comment", "--comment", "cilium snat non-cluster via source route",
-					"-j", "SNAT",
-					"--to-source", r.Src.String())
-				if m.cfg.IPTablesRandomFully {
-					progArgs = append(progArgs, "--random-fully")
-				}
-				if err := prog.runProg(progArgs); err != nil {
-					return err
-				}
+					"!", "-d", snatDstExclusionCIDR)
+			} else {
+				progArgs = append(
+					progArgs,
+					"-d", r.Dst.String())
 			}
-			if initialPass {
-				initialPass = false
-				routes = defaultRoutes
-				goto nextPass
+			if link != nil {
+				progArgs = append(
+					progArgs,
+					"-o", link.Attrs().Name)
+			} else {
+				progArgs = append(
+					progArgs,
+					"!", "-o", "cilium_+")
 			}
+			progArgs = append(
+				progArgs,
+				"-m", "comment", "--comment", "cilium snat non-cluster via source route",
+				"-j", "SNAT",
+				"--to-source", r.Src.String())
+			if m.cfg.IPTablesRandomFully {
+				progArgs = append(progArgs, "--random-fully")
+			}
+			if err := prog.runProg(progArgs); err != nil {
+				return err
+			}
+		}
+		if initialPass {
+			initialPass = false
+			routes = defaultRoutes
+			goto nextPass
 		}
 	} else {
 		// Masquerade all egress traffic leaving the node (catch-all)

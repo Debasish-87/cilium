@@ -348,7 +348,10 @@ stop:
 			} else {
 				close(req.updated)
 			}
-
+		case <-params.routeUpdates:
+			// Trigger reconciliation on route updates to ensure SNAT rules
+			// are reinstalled once routes converge.
+			stateChanged = true
 		case <-refresher.C():
 			stateChanged = true
 		case <-ticker.C():
