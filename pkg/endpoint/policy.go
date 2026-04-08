@@ -736,24 +736,63 @@ func (e *Endpoint) UpdatePolicy(idsToRegen *set.Set[identityPkg.NumericIdentity]
 	// If this endpoint's security ID has a policy update, we must regenerate. Otherwise,
 	// bump the policy revision directly (as long as we didn't miss an update somehow).
 	if !idsToRegen.Has(secID) {
+
+		// FIRST: preserve original behavior — if we missed a revision, regenerate.
 		if e.policyRevision < fromRev {
 			// FIXME: https://github.com/cilium/cilium/issues/36493
-			// Currently policy repository version can be bumped through multiple triggers
-			// async to each other. This can lead to out of order processing of regeneration
-			// events. Continue with endpoint regeneration to be safe but log as Info.
+			// Policy repository revisions may be processed out-of-order due to async updates.
+			// Continue with endpoint regeneration to be safe.
 			e.getLogger().Info(
 				"Endpoint missed a policy revision; triggering regeneration",
 				logfields.PolicyRevision, fromRev,
 			)
 		} else {
-			e.getLogger().Debug(
-				"Policy update is a no-op, bumping policyRevision",
-				logfields.PolicyRevision, toRev,
-			)
-			e.setPolicyRevision(toRev)
 
-			unlock()
-			return
+			// SAFETY: During bootstrap, endpoint identity may be missed in idsToRegen
+			// due to race between policy import and endpoint creation. This can leave
+			// the endpoint with an empty datapath policy despite matching selectors.
+			//
+			// This fallback enforces the invariant:
+			//   selector match ⇒ endpoint must have non-empty policy
+			//
+			// TODO: This does not address the root cause. The underlying issue likely
+			// lies in idsToRegen computation during bootstrap.
+
+			shouldForceRegen := false
+
+			if e.desiredPolicy == nil || e.realizedPolicy == nil {
+				shouldForceRegen = true
+				if e.logLimiter.Allow() {
+					e.getLogger().Warn(
+						"Forcing regeneration: endpoint policy state is nil",
+						logfields.Identity, secID,
+					)
+				}
+			} else {
+				ms := e.desiredPolicy.GetMapState()
+
+				if ms == nil || ms.Len() == 0 {
+					shouldForceRegen = true
+					if e.logLimiter.Allow() {
+						e.getLogger().Warn(
+							"Forcing regeneration: endpoint has empty policy despite selector match",
+							logfields.Identity, secID,
+						)
+					}
+				}
+			}
+
+			// If no fallback condition triggered, retain original skip behavior
+			if !shouldForceRegen {
+				e.getLogger().Debug(
+					"Policy update is a no-op, bumping policyRevision",
+					logfields.PolicyRevision, toRev,
+				)
+				e.setPolicyRevision(toRev)
+
+				unlock()
+				return
+			}
 		}
 	}
 
